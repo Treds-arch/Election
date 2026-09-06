@@ -1,3 +1,9 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<title>Bilik Suara</title>
 <style>
 html, body { margin: 0; padding: 0; min-height: 100%; background: #FFF6E4; }
 
@@ -737,7 +743,8 @@ html, body { margin: 0; padding: 0; min-height: 100%; background: #FFF6E4; }
   #pemilu .print .inked { clip-path: inset(0 0 0 0); }
 }
 </style>
-
+</head>
+<body>
 <div id="pemilu"><div class="stage" id="stage"></div></div>
 
 <script>
@@ -780,62 +787,47 @@ html, body { margin: 0; padding: 0; min-height: 100%; background: #FFF6E4; }
   }
   function deviceKey() { return 'devicevote:' + candidateSetHash() + ':' + deviceFingerprint(); }
 
-  /* ---------- storage (backend Vercel + KV) ---------- */
-  let adminPin = null;      // disimpan di memori tab ini saja, tidak pernah lewat GET publik
-  let configLoadError = false;
+  /* ---------- storage ---------- */
+  async function probeStorage() {
+    if (!window.storage || typeof window.storage.set !== 'function') {
+      storageErr = 'Penyimpanan tidak tersedia (window.storage tidak ada).';
+      return false;
+    }
+    try {
+      const stamp = 'probe-' + Date.now();
+      await window.storage.set('healthcheck', stamp, true);
+      const back = await window.storage.get('healthcheck', true);
+      if (!back || back.value !== stamp) { storageErr = 'Data tertulis tapi terbaca berbeda.'; return false; }
+      return true;
+    } catch (e) { storageErr = 'Gagal menulis: ' + (e && e.message ? e.message : e); return false; }
+  }
 
   async function loadCfg() {
-    try {
-      const res = await fetch('/api/config');
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      cfg = await res.json();
-      configLoadError = false;
-    } catch (e) {
-      cfg = null;
-      configLoadError = true;
-      storageErr = e && e.message ? e.message : String(e);
-    }
+    try { const r = await window.storage.get('config', true); cfg = r ? JSON.parse(r.value) : null; }
+    catch (e) { cfg = null; }
   }
   async function saveCfg(flash) {
+    const prev = cfg.rev || 0; cfg.rev = prev + 1;
     try {
-      const res = await fetch('/api/config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ pin: adminPin, config: cfg }),
-      });
-      const body = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        storageErr = body.error || ('HTTP ' + res.status);
-        toast('Gagal menyimpan: ' + storageErr);
-        return false;
-      }
-      cfg = body;
+      await window.storage.set('config', JSON.stringify(cfg), true);
+      const back = await window.storage.get('config', true);
+      if (!back || JSON.parse(back.value).rev !== cfg.rev) throw new Error('tidak terbaca kembali');
       if (flash) toast(flash);
       return true;
     } catch (e) {
+      cfg.rev = prev;
       storageErr = e && e.message ? e.message : String(e);
-      toast('Gagal menyimpan: jaringan bermasalah');
+      toast('Gagal menyimpan: ' + storageErr);
       return false;
     }
   }
   async function allVoteKeys() {
     try {
-      const res = await fetch('/api/votes');
-      if (!res.ok) return [];
-      const rows = await res.json();
-      return rows.map(v => ({ cand: v.candidateId, nim: v.nim, nama: v.nama, ts: v.ts }));
-    } catch (e) { return []; }
-  }
-  async function verifyPin(pin) {
-    try {
-      const res = await fetch('/api/verify-pin', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ pin }),
+      const r = await window.storage.list('vote:', true);
+      return ((r && r.keys) || []).map(k => {
+        const p = k.split(':'); return { key: k, cand: p[1], nim: p.slice(2).join(':') };
       });
-      const body = await res.json().catch(() => ({ ok: false }));
-      return !!body.ok;
-    } catch (e) { return false; }
+    } catch (e) { return []; }
   }
   function toast(msg) {
     const el = document.createElement('div');
@@ -1021,7 +1013,6 @@ html, body { margin: 0; padding: 0; min-height: 100%; background: #FFF6E4; }
       };
       const ok = await saveCfg();
       if (!ok) { cfg = null; return show('Gagal menyimpan: ' + (storageErr || 'tidak diketahui')); }
-      adminPin = draft.pin.trim();
       draft = null; adminOK = true; go('admin');
     };
   }
@@ -1154,11 +1145,8 @@ html, body { margin: 0; padding: 0; min-height: 100%; background: #FFF6E4; }
       const found = keys.find(k => k.nim === normNim(nim));
       let deviceBlocked = false;
       if (!found && cfg.deviceLock) {
-        try {
-          const r = await fetch('/api/device-check?key=' + encodeURIComponent(deviceFingerprint()));
-          const body = await r.json().catch(() => ({ blocked: false }));
-          deviceBlocked = !!body.blocked;
-        } catch (e) {}
+        try { const dv = await window.storage.get(deviceKey(), true); if (dv) deviceBlocked = true; }
+        catch (e) {}
       }
       voter = { nim: normNim(nim), nama, votedFor: found ? found.cand : undefined, deviceBlocked };
       if (!found) delete voter.votedFor;
@@ -1326,31 +1314,14 @@ html, body { margin: 0; padding: 0; min-height: 100%; background: #FFF6E4; }
       const b = scrim.querySelector('#cyes'), cnoBtn = scrim.querySelector('#cno');
       b.disabled = true; b.innerHTML = '<span class="spin"></span>Mengirim suara';
       if (cnoBtn) cnoBtn.disabled = true;
+      const keys = await allVoteKeys();
+      const dup = keys.find(k => k.nim === voter.nim);
+      if (dup) { modalOpen = false; scrim.remove(); voter.votedFor = dup.cand; paint(); return; }
       try {
-        const res = await fetch('/api/cast-vote', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            candidateId: picked, nim: voter.nim, nama: voter.nama,
-            deviceKey: cfg.deviceLock ? deviceFingerprint() : undefined,
-          }),
-        });
-        const body = await res.json().catch(() => ({ ok: false, reason: 'server-error' }));
-        if (body.ok) {
-          voter.votedFor = picked;
-          modalOpen = false; scrim.remove(); paint();
-          return;
-        }
-        modalOpen = false; scrim.remove();
-        if (body.reason === 'duplicate') {
-          voter.votedFor = body.candidateId || null;
-          if (!voter.votedFor) delete voter.votedFor;
-        } else if (body.reason === 'device') {
-          voter.deviceBlocked = true;
-        } else if (body.reason === 'closed') {
-          cfg.isOpen = false;
-        }
-        paint();
+        await window.storage.set(`vote:${picked}:${voter.nim}`, JSON.stringify({ nama: voter.nama, ts: Date.now() }), true);
+        if (cfg.deviceLock) { try { await window.storage.set(deviceKey(), JSON.stringify({ ts: Date.now() }), true); } catch (e2) {} }
+        voter.votedFor = picked;
+        modalOpen = false; scrim.remove(); paint();
       } catch (e) {
         submitting = false;
         b.disabled = false; b.textContent = 'Gagal terkirim, coba lagi';
@@ -1508,16 +1479,10 @@ html, body { margin: 0; padding: 0; min-height: 100%; background: #FFF6E4; }
         <button class="btn solid" id="ggo" style="margin-top:8px">Masuk</button>
       </div>
       <div class="footer"><button class="textlink" id="gback">Kembali ke surat suara</button></div>`;
-    const tryIn = async () => {
+    const tryIn = () => {
       const v = stage.querySelector('#gp').value.trim();
-      const btn = stage.querySelector('#ggo');
-      btn.disabled = true; btn.innerHTML = '<span class="spin"></span>Memeriksa';
-      const ok = await verifyPin(v);
-      if (ok) { adminPin = v; adminOK = true; go('admin'); }
-      else {
-        btn.disabled = false; btn.textContent = 'Masuk';
-        const e = stage.querySelector('#gerr'); e.textContent = 'PIN tidak cocok.'; e.style.display = 'block';
-      }
+      if (v === cfg.pin) { adminOK = true; go('admin'); }
+      else { const e = stage.querySelector('#gerr'); e.textContent = 'PIN tidak cocok.'; e.style.display = 'block'; }
     };
     stage.querySelector('#ggo').onclick = tryIn;
     stage.querySelector('#gp').onkeydown = e => { if (e.key === 'Enter') tryIn(); };
@@ -1596,7 +1561,7 @@ html, body { margin: 0; padding: 0; min-height: 100%; background: #FFF6E4; }
         <button class="btn danger" id="awipe">Hapus semua suara</button>
       </div>`;
 
-    stage.querySelector('#alogout').onclick = () => { adminOK = false; adminPin = null; draft = null; go('voter'); };
+    stage.querySelector('#alogout').onclick = () => { adminOK = false; draft = null; go('voter'); };
     function syncOpenPill() {
       const pill = stage.querySelector('.bar .pill');
       if (pill) {
@@ -1652,8 +1617,12 @@ html, body { margin: 0; padding: 0; min-height: 100%; background: #FFF6E4; }
     stage.querySelector('#aroll').onclick = async () => {
       const bx = stage.querySelector('#arollbox');
       bx.innerHTML = `<div class="empty">Memuat…</div>`;
-      const rows = await allVoteKeys();
-      if (!rows.length) { bx.innerHTML = `<div class="empty">Belum ada yang memilih.</div>`; return; }
+      const ks = await allVoteKeys();
+      if (!ks.length) { bx.innerHTML = `<div class="empty">Belum ada yang memilih.</div>`; return; }
+      const rows = await Promise.all(ks.map(async k => {
+        try { const r = await window.storage.get(k.key, true); const v = JSON.parse(r.value); return { nim: k.nim, nama: v.nama, ts: v.ts }; }
+        catch (e) { return { nim: k.nim, nama: ',', ts: 0 }; }
+      }));
       rows.sort((a, b) => b.ts - a.ts);
       bx.innerHTML = `<div class="voterlist">${rows.map(r => `<div class="voteritem"><span>${esc(r.nama)}</span><span>${esc(r.nim)}</span></div>`).join('')}</div>`;
     };
@@ -1706,15 +1675,9 @@ html, body { margin: 0; padding: 0; min-height: 100%; background: #FFF6E4; }
         danger: true,
       }, awipeBtn);
       if (!ok) return;
-      try {
-        const res = await fetch('/api/admin-reset', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ pin: adminPin }),
-        });
-        if (!res.ok) { toast('Gagal menghapus suara'); return; }
-        toast('Semua suara dihapus'); adminView();
-      } catch (e) { toast('Gagal menghapus suara: jaringan bermasalah'); }
+      const ks = await allVoteKeys();
+      for (const k of ks) { try { await window.storage.delete(k.key, true); } catch (e) {} }
+      toast('Semua suara dihapus'); adminView();
     };
 
     refreshTally();
@@ -1748,12 +1711,12 @@ html, body { margin: 0; padding: 0; min-height: 100%; background: #FFF6E4; }
   async function init() {
     stage.innerHTML = `<div class="sheet"><div class="empty">Memuat…</div></div>`;
     root.classList.remove('booth', 'wide');
-    await loadCfg();
-    if (configLoadError) {
+    const ok = await probeStorage();
+    if (!ok) {
       stage.innerHTML = `
         <div class="sheet">
-          <div class="head"><h1>Tidak bisa terhubung ke server</h1>
-          <p class="lede">Halaman ini gagal memuat data dari backend. Cek koneksi internet, atau backend belum tersambung ke database (Vercel KV).</p></div>
+          <div class="head"><h1>Data tidak tersimpan</h1>
+          <p class="lede">Halaman ini butuh penyimpanan artifact untuk menyimpan pengaturan dan suara, dan penyimpanan itu tidak aktif di tampilan sekarang. Aplikasi harus dibuka melalui link publik hasil "Publish" pada artifact ini, di browser desktop atau web (bukan aplikasi mobile Claude).</p></div>
           <div class="field"><label>Pesan teknis</label>
           <p class="note" style="padding:12px;background:var(--parchment-2);border-radius:9px;border:1px solid var(--edge)">${esc(storageErr || 'tidak diketahui')}</p></div>
           <button class="btn line" id="retry">Coba lagi</button>
@@ -1761,9 +1724,12 @@ html, body { margin: 0; padding: 0; min-height: 100%; background: #FFF6E4; }
       stage.querySelector('#retry').onclick = () => init();
       return;
     }
+    await loadCfg();
     paint();
     startPoll();
   }
   init();
 })();
 </script>
+</body>
+</html>
