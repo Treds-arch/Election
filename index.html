@@ -6,7 +6,7 @@
 <title>Bilik Suara</title>
 <style>
 html, body { margin: 0; padding: 0; min-height: 100%; background: #FFF6E4; }
- 
+
 #pemilu {
   /* Palet diambil dari banner Kencana Muda 2026: emas jingga, cokelat sepia, tinta wayang */
   --gold:#F5A83C;
@@ -39,8 +39,9 @@ html, body { margin: 0; padding: 0; min-height: 100%; background: #FFF6E4; }
   font-family: var(--body);
   color: var(--ink);
   min-height: 100vh;
+  min-height: 100svh;
   min-height: 100dvh;
-  padding: 14px 12px 140px;
+  padding: 14px 12px 28px;
   box-sizing: border-box;
   display: flex;
   justify-content: center;
@@ -62,6 +63,7 @@ html, body { margin: 0; padding: 0; min-height: 100%; background: #FFF6E4; }
     radial-gradient(60% 40% at 0% 100%, rgba(122,62,20,.10), transparent 70%);
 }
 #pemilu.booth { background: linear-gradient(180deg, #FFD48A 0%, #F5A83C 48%, #C96A22 82%, #A9541A 100%); }
+#pemilu.booth { padding-bottom: 140px; }
 #pemilu.booth::before {
   background:
     radial-gradient(95% 60% at 50% 6%, rgba(255,240,205,.6), transparent 68%),
@@ -763,6 +765,7 @@ html, body { margin: 0; padding: 0; min-height: 100%; background: #FFF6E4; }
   let voter = null;
   let picked = null;
   let adminOK = false;
+  let adminPin = null;
   let modalOpen = false;
   let poll = null;
   let draft = null;
@@ -788,35 +791,38 @@ html, body { margin: 0; padding: 0; min-height: 100%; background: #FFF6E4; }
   }
   function deviceKey() { return 'devicevote:' + candidateSetHash() + ':' + deviceFingerprint(); }
 
-  /* ---------- storage ---------- */
-  async function probeStorage() {
-    if (!window.storage || typeof window.storage.set !== 'function') {
-      storageErr = 'Penyimpanan tidak tersedia (window.storage tidak ada).';
-      return false;
-    }
-    try {
-      const stamp = 'probe-' + Date.now();
-      await window.storage.set('healthcheck', stamp, true);
-      const back = await window.storage.get('healthcheck', true);
-      if (!back || back.value !== stamp) { storageErr = 'Data tertulis tapi terbaca berbeda.'; return false; }
-      return true;
-    } catch (e) { storageErr = 'Gagal menulis: ' + (e && e.message ? e.message : e); return false; }
+  /* ---------- backend (Vercel serverless functions + Supabase) ---------- */
+  const API = '/api';
+  async function apiGet(path) {
+    const r = await fetch(API + path);
+    let body = null;
+    try { body = await r.json(); } catch (e) {}
+    if (!r.ok) throw new Error((body && (body.error || body.detail)) || ('HTTP ' + r.status));
+    return body;
+  }
+  async function apiPost(path, payload) {
+    const r = await fetch(API + path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload || {})
+    });
+    let body = null;
+    try { body = await r.json(); } catch (e) {}
+    if (!r.ok) throw new Error((body && (body.error || body.detail)) || ('HTTP ' + r.status));
+    return body;
   }
 
   async function loadCfg() {
-    try { const r = await window.storage.get('config', true); cfg = r ? JSON.parse(r.value) : null; }
-    catch (e) { cfg = null; }
+    storageErr = null;
+    try { cfg = await apiGet('/config'); }
+    catch (e) { cfg = null; storageErr = e && e.message ? e.message : String(e); }
   }
   async function saveCfg(flash) {
-    const prev = cfg.rev || 0; cfg.rev = prev + 1;
     try {
-      await window.storage.set('config', JSON.stringify(cfg), true);
-      const back = await window.storage.get('config', true);
-      if (!back || JSON.parse(back.value).rev !== cfg.rev) throw new Error('tidak terbaca kembali');
+      cfg = await apiPost('/config', { pin: adminPin, config: cfg });
       if (flash) toast(flash);
       return true;
     } catch (e) {
-      cfg.rev = prev;
       storageErr = e && e.message ? e.message : String(e);
       toast('Gagal menyimpan: ' + storageErr);
       return false;
@@ -824,10 +830,8 @@ html, body { margin: 0; padding: 0; min-height: 100%; background: #FFF6E4; }
   }
   async function allVoteKeys() {
     try {
-      const r = await window.storage.list('vote:', true);
-      return ((r && r.keys) || []).map(k => {
-        const p = k.split(':'); return { key: k, cand: p[1], nim: p.slice(2).join(':') };
-      });
+      const rows = await apiGet('/votes');
+      return (rows || []).map(v => ({ cand: v.candidateId, nim: v.nim, nama: v.nama, ts: v.ts }));
     } catch (e) { return []; }
   }
   function toast(msg) {
@@ -1005,16 +1009,24 @@ html, body { margin: 0; padding: 0; min-height: 100%; background: #FFF6E4; }
       if (!draft.title.trim()) return show('Nama pemilihan belum diisi.');
       if (cands.length < 2) return show('Butuh minimal dua kandidat.');
       if (draft.pin.trim().length < 4) return show('PIN minimal 4 karakter.');
-      cfg = {
-        rev: 0, title: draft.title.trim(), pin: draft.pin.trim(),
+      const pinVal = draft.pin.trim();
+      const freshCfg = {
+        title: draft.title.trim(), pin: pinVal,
         candidates: cands.map(c => cleanCand(c)),
         target: draft.target ? parseInt(draft.target, 10) : null,
         usePair: !!draft.usePair,
-        isOpen: true, published: false, deviceLock: false, finalized: false, createdAt: Date.now()
+        isOpen: true, published: false, deviceLock: false, finalized: false
       };
-      const ok = await saveCfg();
-      if (!ok) { cfg = null; return show('Gagal menyimpan: ' + (storageErr || 'tidak diketahui')); }
-      draft = null; adminOK = true; go('admin');
+      const btn = stage.querySelector('#sgo');
+      btn.disabled = true; btn.innerHTML = '<span class="spin"></span>Menyiapkan';
+      try {
+        cfg = await apiPost('/config', { config: freshCfg });
+        adminPin = pinVal;
+        draft = null; adminOK = true; go('admin');
+      } catch (e) {
+        btn.disabled = false; btn.textContent = 'Buka pemungutan suara';
+        show('Gagal menyimpan: ' + (e && e.message ? e.message : e));
+      }
     };
   }
 
@@ -1146,8 +1158,10 @@ html, body { margin: 0; padding: 0; min-height: 100%; background: #FFF6E4; }
       const found = keys.find(k => k.nim === normNim(nim));
       let deviceBlocked = false;
       if (!found && cfg.deviceLock) {
-        try { const dv = await window.storage.get(deviceKey(), true); if (dv) deviceBlocked = true; }
-        catch (e) {}
+        try {
+          const dv = await apiGet('/device-check?key=' + encodeURIComponent(deviceKey()));
+          deviceBlocked = !!(dv && dv.blocked);
+        } catch (e) {}
       }
       voter = { nim: normNim(nim), nama, votedFor: found ? found.cand : undefined, deviceBlocked };
       if (!found) delete voter.votedFor;
@@ -1315,13 +1329,20 @@ html, body { margin: 0; padding: 0; min-height: 100%; background: #FFF6E4; }
       const b = scrim.querySelector('#cyes'), cnoBtn = scrim.querySelector('#cno');
       b.disabled = true; b.innerHTML = '<span class="spin"></span>Mengirim suara';
       if (cnoBtn) cnoBtn.disabled = true;
-      const keys = await allVoteKeys();
-      const dup = keys.find(k => k.nim === voter.nim);
-      if (dup) { modalOpen = false; scrim.remove(); voter.votedFor = dup.cand; paint(); return; }
       try {
-        await window.storage.set(`vote:${picked}:${voter.nim}`, JSON.stringify({ nama: voter.nama, ts: Date.now() }), true);
-        if (cfg.deviceLock) { try { await window.storage.set(deviceKey(), JSON.stringify({ ts: Date.now() }), true); } catch (e2) {} }
-        voter.votedFor = picked;
+        const result = await apiPost('/cast-vote', {
+          candidateId: picked, nim: voter.nim, nama: voter.nama,
+          deviceKey: cfg.deviceLock ? deviceKey() : undefined
+        });
+        if (result.ok) {
+          voter.votedFor = picked;
+        } else if (result.reason === 'duplicate') {
+          voter.votedFor = result.candidateId || undefined;
+        } else if (result.reason === 'device') {
+          voter.deviceBlocked = true;
+        } else {
+          throw new Error(result.reason || 'gagal');
+        }
         modalOpen = false; scrim.remove(); paint();
       } catch (e) {
         submitting = false;
@@ -1480,10 +1501,20 @@ html, body { margin: 0; padding: 0; min-height: 100%; background: #FFF6E4; }
         <button class="btn solid" id="ggo" style="margin-top:8px">Masuk</button>
       </div>
       <div class="footer"><button class="textlink" id="gback">Kembali ke surat suara</button></div>`;
-    const tryIn = () => {
+    const tryIn = async () => {
       const v = stage.querySelector('#gp').value.trim();
-      if (v === cfg.pin) { adminOK = true; go('admin'); }
-      else { const e = stage.querySelector('#gerr'); e.textContent = 'PIN tidak cocok.'; e.style.display = 'block'; }
+      const btn = stage.querySelector('#ggo');
+      const e = stage.querySelector('#gerr');
+      e.style.display = 'none';
+      btn.disabled = true;
+      try {
+        const res = await apiPost('/verify-pin', { pin: v });
+        if (res && res.ok) { adminPin = v; adminOK = true; go('admin'); return; }
+        e.textContent = 'PIN tidak cocok.'; e.style.display = 'block';
+      } catch (err) {
+        e.textContent = 'Gagal memeriksa PIN: ' + (err && err.message ? err.message : err);
+        e.style.display = 'block';
+      } finally { btn.disabled = false; }
     };
     stage.querySelector('#ggo').onclick = tryIn;
     stage.querySelector('#gp').onkeydown = e => { if (e.key === 'Enter') tryIn(); };
@@ -1562,7 +1593,7 @@ html, body { margin: 0; padding: 0; min-height: 100%; background: #FFF6E4; }
         <button class="btn danger" id="awipe">Hapus semua suara</button>
       </div>`;
 
-    stage.querySelector('#alogout').onclick = () => { adminOK = false; draft = null; go('voter'); };
+    stage.querySelector('#alogout').onclick = () => { adminOK = false; adminPin = null; draft = null; go('voter'); };
     function syncOpenPill() {
       const pill = stage.querySelector('.bar .pill');
       if (pill) {
@@ -1620,11 +1651,7 @@ html, body { margin: 0; padding: 0; min-height: 100%; background: #FFF6E4; }
       bx.innerHTML = `<div class="empty">Memuat…</div>`;
       const ks = await allVoteKeys();
       if (!ks.length) { bx.innerHTML = `<div class="empty">Belum ada yang memilih.</div>`; return; }
-      const rows = await Promise.all(ks.map(async k => {
-        try { const r = await window.storage.get(k.key, true); const v = JSON.parse(r.value); return { nim: k.nim, nama: v.nama, ts: v.ts }; }
-        catch (e) { return { nim: k.nim, nama: ',', ts: 0 }; }
-      }));
-      rows.sort((a, b) => b.ts - a.ts);
+      const rows = ks.map(k => ({ nim: k.nim, nama: k.nama, ts: k.ts })).sort((a, b) => b.ts - a.ts);
       bx.innerHTML = `<div class="voterlist">${rows.map(r => `<div class="voteritem"><span>${esc(r.nama)}</span><span>${esc(r.nim)}</span></div>`).join('')}</div>`;
     };
 
@@ -1676,9 +1703,12 @@ html, body { margin: 0; padding: 0; min-height: 100%; background: #FFF6E4; }
         danger: true,
       }, awipeBtn);
       if (!ok) return;
-      const ks = await allVoteKeys();
-      for (const k of ks) { try { await window.storage.delete(k.key, true); } catch (e) {} }
-      toast('Semua suara dihapus'); adminView();
+      try {
+        await apiPost('/admin-reset', { pin: adminPin });
+        toast('Semua suara dihapus'); adminView();
+      } catch (e) {
+        toast('Gagal menghapus: ' + (e && e.message ? e.message : e));
+      }
     };
 
     refreshTally();
@@ -1712,12 +1742,12 @@ html, body { margin: 0; padding: 0; min-height: 100%; background: #FFF6E4; }
   async function init() {
     stage.innerHTML = `<div class="sheet"><div class="empty">Memuat…</div></div>`;
     root.classList.remove('booth', 'wide');
-    const ok = await probeStorage();
-    if (!ok) {
+    await loadCfg();
+    if (storageErr) {
       stage.innerHTML = `
         <div class="sheet">
-          <div class="head"><h1>Data tidak tersimpan</h1>
-          <p class="lede">Halaman ini butuh penyimpanan artifact untuk menyimpan pengaturan dan suara, dan penyimpanan itu tidak aktif di tampilan sekarang. Aplikasi harus dibuka melalui link publik hasil "Publish" pada artifact ini, di browser desktop atau web (bukan aplikasi mobile Claude).</p></div>
+          <div class="head"><h1>Gagal terhubung ke server</h1>
+          <p class="lede">Tidak bisa mengambil data dari server. Coba periksa koneksi internet, atau coba lagi sebentar lagi.</p></div>
           <div class="field"><label>Pesan teknis</label>
           <p class="note" style="padding:12px;background:var(--parchment-2);border-radius:9px;border:1px solid var(--edge)">${esc(storageErr || 'tidak diketahui')}</p></div>
           <button class="btn line" id="retry">Coba lagi</button>
@@ -1725,7 +1755,6 @@ html, body { margin: 0; padding: 0; min-height: 100%; background: #FFF6E4; }
       stage.querySelector('#retry').onclick = () => init();
       return;
     }
-    await loadCfg();
     paint();
     startPoll();
   }
